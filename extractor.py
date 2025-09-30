@@ -5,7 +5,19 @@ from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
+try:
+    # new recommended SDK
+    
+    from google import genai as genai_client
+    NEW_GENAI = True
+except Exception:
+    # fallback: older "google.generativeai" package
+    import google.generativeai as genai_client
+    NEW_GENAI = False
 
+import logging
+logger = logging.getLogger("extractor")
+logger.setLevel(logging.INFO)
 import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
@@ -205,7 +217,7 @@ def build_single_text(pages: List[Dict[str, Any]]) -> str:
 # ----------------------------
 # Gemini-only extraction (unchanged)
 # ----------------------------
-GEMINI_MODELS_ORDER = ["gemini-1.5-flash", "gemini-1.5-pro"]
+GEMINI_MODELS_ORDER = ["gemini-2.5-pro", "gemini-2.5-flash"]
 
 SCHEMA_PROMPT = """You are an information extraction assistant.
 You are given the full text of a will-like document.
@@ -266,20 +278,58 @@ Rules:
 - Output STRICT JSON. No extra commentary or code fences.
 """
 
-def _gemini_call(prompt: str, model_name: str, retries: int = 4) -> Optional[str]:
+def _gemini_call(prompt: str, model_name: str, retries: int = 4, timeout: int = 60) -> Optional[str]:
+    """
+    New-style call to Google GenAI. Uses google-genai if available; falls back to older package.
+    Returns response.text on success, else None.
+    """
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+        raise RuntimeError("GOOGLE_API_KEY is not set in environment.")
+
     last_err = None
+
     for attempt in range(retries):
         try:
-            resp = model.generate_content(prompt)
-            return resp.text
+            if NEW_GENAI:
+                # new client usage
+                # pip install google-genai
+                client = genai_client.Client(api_key=api_key)
+                # 'contents' accepts string or list (multimodal)
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    # generation parameters can be added here if needed:
+                    # max_output_tokens=800,
+                )
+                text = getattr(resp, "text", None)
+                if text is None:
+                    # some responses have a different structure; try to stringify
+                    logger.info("Raw response object: %s", resp)
+                    text = str(resp)
+                logger.info("Gemini (%s) success (attempt %d)", model_name, attempt+1)
+                return text
+
+            else:
+                # fallback to old API (your previous style)
+                genai_client.configure(api_key=api_key)
+                model = genai_client.GenerativeModel(model_name)
+                resp = model.generate_content(prompt)
+                text = getattr(resp, "text", None)
+                if text is None:
+                    logger.info("Old SDK raw response: %s", resp)
+                    text = str(resp)
+                logger.info("Gemini (old sdk) success (attempt %d)", attempt+1)
+                return text
+
         except Exception as e:
-            last_err = str(e)
-            time.sleep(2 ** attempt)
+            last_err = e
+            logger.warning("Gemini call failed (model=%s attempt=%d): %s", model_name, attempt+1, e)
+            # exponential backoff
+            import time
+            time.sleep(min(2 ** attempt, 16))
+
+    logger.error("Gemini call failed after %d attempts. Last error: %s", retries, last_err)
     return None
 
 def _clean_json_text(s: str) -> str:
